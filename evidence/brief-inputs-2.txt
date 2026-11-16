@@ -1,0 +1,1123 @@
+]633;E;for f in "$S1/README.md" "$S1/../../README.md";44dc1b88-5fef-4dfc-afb0-9b7f9f571343]633;C]633;E;echo "##### antipatterns";44dc1b88-5fef-4dfc-afb0-9b7f9f571343]633;C##### antipatterns
+     1	"""Anti-pattern audit.
+     2	
+     3	Verifies, by static AST analysis, that the agentic loop does NOT:
+     4	- use string-membership tests against text content to drive control flow
+     5	- use an integer-literal iteration cap as its primary stopping mechanism
+     6	- omit reference to `stop_reason` as the loop-breaking signal
+     7	
+     8	And that the package broadly does not branch on `claim_type` equality
+     9	outside of the tool-schema definitions and the cost-estimate module.
+    10	"""
+    11	
+    12	from __future__ import annotations
+    13	
+    14	import ast
+    15	from pathlib import Path
+    16	
+    17	PKG = Path(__file__).resolve().parents[1] / "claims_intake"
+    18	LOOP_PY = PKG / "loop.py"
+    19	
+    20	
+    21	def _parse(path: Path) -> ast.Module:
+    22	    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    23	
+    24	
+    25	# ---------------------------------------------------------------------------
+    26	# No string-membership tests against assistant text drive control flow
+    27	# ---------------------------------------------------------------------------
+    28	def test_no_string_membership_against_text_in_loop() -> None:
+    29	    """No `"some_token" in <something>` expressions in loop.py.
+    30	
+    31	    Heuristic: any Compare node using `In` whose left operand is a string
+    32	    Constant is flagged. The loop has no legitimate reason to test for the
+    33	    presence of a magic string inside the model's output.
+    34	    """
+    35	    tree = _parse(LOOP_PY)
+    36	    offenders: list[str] = []
+    37	    for node in ast.walk(tree):
+    38	        if isinstance(node, ast.Compare):
+    39	            for op in node.ops:
+    40	                if isinstance(op, ast.In) and isinstance(node.left, ast.Constant) and isinstance(node.left.value, str):
+    41	                    offenders.append(ast.unparse(node))
+    42	    assert offenders == [], (
+    43	        "loop.py contains string-membership tests that may be driving control flow:\n  "
+    44	        + "\n  ".join(offenders)
+    45	    )
+    46	
+    47	
+    48	# ---------------------------------------------------------------------------
+    49	# No integer-literal iteration cap as the primary stopping mechanism
+    50	# ---------------------------------------------------------------------------
+    51	def test_no_integer_literal_iteration_cap_in_loop() -> None:
+    52	    """No `for _ in range(<int literal>)` and no `while <var> < <int literal>` in loop.py.
+    53	
+    54	    Token/wall-clock/config-sourced budgets are explicitly allowed because
+    55	    they read their cap from a `Budget` instance (an attribute access or a
+    56	    function arg), not from a literal. If you need a cap, pass it in.
+    57	    """
+    58	    tree = _parse(LOOP_PY)
+    59	    offenders: list[str] = []
+    60	
+    61	    for node in ast.walk(tree):
+    62	        # `for _ in range(<int literal>, ...)`
+    63	        if (
+    64	            isinstance(node, ast.For)
+    65	            and isinstance(node.iter, ast.Call)
+    66	            and isinstance(node.iter.func, ast.Name)
+    67	            and node.iter.func.id == "range"
+    68	            and any(isinstance(a, ast.Constant) and isinstance(a.value, int) for a in node.iter.args)
+    69	        ):
+    70	            offenders.append(f"for-range-literal at line {node.lineno}: {ast.unparse(node.iter)}")
+    71	
+    72	        # `while <something> <comparison-with-int-literal>`
+    73	        if isinstance(node, ast.While) and isinstance(node.test, ast.Compare):
+    74	            for cmp in node.test.comparators:
+    75	                if isinstance(cmp, ast.Constant) and isinstance(cmp.value, int):
+    76	                    offenders.append(f"while-int-literal at line {node.lineno}: {ast.unparse(node.test)}")
+    77	
+    78	    assert offenders == [], (
+    79	        "loop.py uses an integer-literal iteration cap as a stopping mechanism. "
+    80	        "Use a Budget (token or wall-clock, sourced from config) instead:\n  "
+    81	        + "\n  ".join(offenders)
+    82	    )
+    83	
+    84	
+    85	# ---------------------------------------------------------------------------
+    86	# stop_reason is referenced in loop.py and breaks the while loop
+    87	# ---------------------------------------------------------------------------
+    88	def test_stop_reason_is_loop_control() -> None:
+    89	    tree = _parse(LOOP_PY)
+    90	
+    91	    references = [
+    92	        node
+    93	        for node in ast.walk(tree)
+    94	        if (isinstance(node, ast.Attribute) and node.attr == "stop_reason")
+    95	        or (isinstance(node, ast.Name) and node.id == "stop_reason")
+    96	    ]
+    97	    assert references, "loop.py never references stop_reason"
+    98	
+    99	    # Find the main while loop and verify it both contains a `stop_reason`
+   100	    # reference AND exits via either a `return` or `raise` predicated on it.
+   101	    while_loops = [n for n in ast.walk(tree) if isinstance(n, ast.While)]
+   102	    assert while_loops, "loop.py has no `while` loop"
+   103	
+   104	    found_stop_reason_exit = False
+   105	    for wloop in while_loops:
+   106	        body_text = "\n".join(ast.unparse(n) for n in wloop.body)
+   107	        if "stop_reason" in body_text and ("return" in body_text or "raise" in body_text):
+   108	            found_stop_reason_exit = True
+   109	            break
+   110	    assert found_stop_reason_exit, (
+   111	        "No `while` loop in loop.py exits via a return/raise predicated on stop_reason. "
+   112	        "The loop must terminate on stop_reason == 'end_turn' and raise on unexpected values."
+   113	    )
+   114	
+   115	
+   116	# ---------------------------------------------------------------------------
+   117	# No `if claim_type == "..."` branching outside tools.py / pricing.py
+   118	# ---------------------------------------------------------------------------
+   119	def test_no_claim_type_equality_branching_in_package() -> None:
+   120	    """Decision logic about claim type lives in the model, not in Python.
+   121	
+   122	    tools.py is exempt (it defines the enum in the input_schema).
+   123	    pricing.py is exempt (it may map claim_type to per-queue cost weights).
+   124	    """
+   125	    exempt = {"tools.py", "pricing.py"}
+   126	    offenders: list[str] = []
+   127	
+   128	    for py_file in PKG.rglob("*.py"):
+   129	        if py_file.name in exempt or py_file.name == "__init__.py":
+   130	            continue
+   131	        tree = _parse(py_file)
+   132	        for node in ast.walk(tree):
+   133	            if not isinstance(node, ast.Compare):
+   134	                continue
+   135	            if not any(isinstance(op, ast.Eq) for op in node.ops):
+   136	                continue
+   137	            left = node.left
+   138	            left_name = (
+   139	                left.attr if isinstance(left, ast.Attribute)
+   140	                else left.id if isinstance(left, ast.Name)
+   141	                else None
+   142	            )
+   143	            if left_name != "claim_type":
+   144	                continue
+   145	            if any(isinstance(c, ast.Constant) and isinstance(c.value, str) for c in node.comparators):
+   146	                offenders.append(f"{py_file.name}:{node.lineno}: {ast.unparse(node)}")
+   147	
+   148	    assert offenders == [], (
+   149	        "Python is branching on claim_type equality. Move this decision into the model "
+   150	        "(via tool calls and prompts), not into harness code:\n  "
+   151	        + "\n  ".join(offenders)
+   152	    )
+##### tools
+     1	"""Tool schemas and dispatcher.
+     2	
+     3	Seven tools, registered with Anthropic tool-use shape. The dispatcher returns
+     4	serialized JSON strings to be wrapped as `tool_result` content. Errors follow
+     5	the "Graceful Tool Failure" shape:
+     6	
+     7	    {"is_error": true,
+     8	     "error_category": "transient"|"permanent",
+     9	     "is_retryable": bool,
+    10	     "message": "..."}
+    11	
+    12	Errors are never raised to the loop.
+    13	"""
+    14	
+    15	from __future__ import annotations
+    16	
+    17	import json
+    18	from pathlib import Path
+    19	from typing import Any
+    20	
+    21	from claims_intake.session import ClaimSession
+    22	
+    23	CLAIM_TYPES = ["property_damage", "theft", "liability", "auto"]
+    24	SEVERITIES = ["low", "medium", "high"]
+    25	
+    26	# ----------------------------------------------------------------------------
+    27	# Schemas — passed verbatim to the Anthropic Messages API as the `tools` arg.
+    28	# ----------------------------------------------------------------------------
+    29	
+    30	TOOL_SCHEMAS: list[dict[str, Any]] = [
+    31	    {
+    32	        "name": "lookup_policy",
+    33	        "description": (
+    34	            "Look up a policyholder's coverage record. Use this early in the "
+    35	            "conversation to confirm the policy exists, what is covered, and the "
+    36	            "deductible. Returns coverage, deductible, status, and policy_holder."
+    37	        ),
+    38	        "input_schema": {
+    39	            "type": "object",
+    40	            "properties": {
+    41	                "policy_id": {"type": "string", "description": "Policy identifier, e.g. POL-1001"}
+    42	            },
+    43	            "required": ["policy_id"],
+    44	        },
+    45	    },
+    46	    {
+    47	        "name": "record_claim_fact",
+    48	        "description": (
+    49	            "Record one normalized fact extracted from the claimant's statements "
+    50	            "(e.g., incident_date, location, description, items_lost, injury_party). "
+    51	            "Call once per fact. Facts accumulate into the case file used by routing."
+    52	        ),
+    53	        "input_schema": {
+    54	            "type": "object",
+    55	            "properties": {
+    56	                "field": {
+    57	                    "type": "string",
+    58	                    "description": "Snake_case field name, e.g. incident_date or location",
+    59	                },
+    60	                "value": {"type": "string", "description": "The fact as a short string"},
+    61	            },
+    62	            "required": ["field", "value"],
+    63	        },
+    64	    },
+    65	    {
+    66	        "name": "classify_claim",
+    67	        "description": (
+    68	            "Commit to a claim type with a confidence score and rationale. Call "
+    69	            "this exactly once per claim, after enough facts and clarifications "
+    70	            "have been gathered. If confidence is below 0.6, prefer escalate_to_human."
+    71	        ),
+    72	        "input_schema": {
+    73	            "type": "object",
+    74	            "properties": {
+    75	                "claim_type": {"type": "string", "enum": CLAIM_TYPES},
+    76	                "confidence": {
+    77	                    "type": "number",
+    78	                    "minimum": 0.0,
+    79	                    "maximum": 1.0,
+    80	                    "description": "0.0 = no idea; 1.0 = certain",
+    81	                },
+    82	                "rationale": {
+    83	                    "type": "string",
+    84	                    "description": "One sentence explaining why this type fits the facts",
+    85	                },
+    86	            },
+    87	            "required": ["claim_type", "confidence", "rationale"],
+    88	        },
+    89	    },
+    90	    {
+    91	        "name": "assess_severity",
+    92	        "description": (
+    93	            "Commit to a severity bucket with a rationale. Call this exactly once "
+    94	            "per claim, after classification. Severity reflects damage magnitude, "
+    95	            "injury severity, and policy coverage limits."
+    96	        ),
+    97	        "input_schema": {
+    98	            "type": "object",
+    99	            "properties": {
+   100	                "severity": {"type": "string", "enum": SEVERITIES},
+   101	                "rationale": {"type": "string"},
+   102	            },
+   103	            "required": ["severity", "rationale"],
+   104	        },
+   105	    },
+   106	    {
+   107	        "name": "request_clarification",
+   108	        "description": (
+   109	            "Ask the claimant ONE clarifying question to disambiguate the claim "
+   110	            "type or fill a critical missing fact. Use only when the claim type is "
+   111	            "genuinely ambiguous between two or more types. Returns the claimant's "
+   112	            "reply, or the literal string NO_RESPONSE if the claimant cannot answer."
+   113	        ),
+   114	        "input_schema": {
+   115	            "type": "object",
+   116	            "properties": {
+   117	                "question": {"type": "string", "description": "A single specific question"},
+   118	                "ambiguity_between": {
+   119	                    "type": "array",
+   120	                    "items": {"type": "string", "enum": CLAIM_TYPES},
+   121	                    "minItems": 2,
+   122	                    "description": "Candidate claim types the question is meant to distinguish",
+   123	                },
+   124	            },
+   125	            "required": ["question", "ambiguity_between"],
+   126	        },
+   127	    },
+   128	    {
+   129	        "name": "route_to_adjuster",
+   130	        "description": (
+   131	            "TERMINAL TOOL. Route this claim to the matching adjuster queue. "
+   132	            "Call this exactly once when classification confidence is at least "
+   133	            "0.6 and severity has been assessed. After this, your next response "
+   134	            "should be a brief confirmation and stop with end_turn."
+   135	        ),
+   136	        "input_schema": {
+   137	            "type": "object",
+   138	            "properties": {
+   139	                "queue": {"type": "string", "enum": CLAIM_TYPES},
+   140	                "claim_summary": {
+   141	                    "type": "string",
+   142	                    "description": "Two-to-three sentence summary the adjuster will read first",
+   143	                },
+   144	            },
+   145	            "required": ["queue", "claim_summary"],
+   146	        },
+   147	    },
+   148	    {
+   149	        "name": "escalate_to_human",
+   150	        "description": (
+   151	            "TERMINAL TOOL. Escalate this claim to a human reviewer when "
+   152	            "classification confidence is below 0.6 even after clarification, or "
+   153	            "when the claim cannot be routed safely (multiple plausible types, "
+   154	            "missing critical facts the claimant cannot supply, policy disputes). "
+   155	            "Call this exactly once. After this, your next response should be a "
+   156	            "brief confirmation and stop with end_turn."
+   157	        ),
+   158	        "input_schema": {
+   159	            "type": "object",
+   160	            "properties": {
+   161	                "reason": {
+   162	                    "type": "string",
+   163	                    "description": "Short reason: unresolved_ambiguity | low_confidence | missing_facts | policy_dispute | other",
+   164	                },
+   165	                "structured_summary": {
+   166	                    "type": "object",
+   167	                    "properties": {
+   168	                        "policy_id": {"type": "string"},
+   169	                        "root_cause": {"type": "string"},
+   170	                        "candidate_claim_types": {
+   171	                            "type": "array",
+   172	                            "items": {"type": "string", "enum": CLAIM_TYPES},
+   173	                        },
+   174	                        "case_facts": {"type": "object"},
+   175	                        "recommended_action": {"type": "string"},
+   176	                        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+   177	                    },
+   178	                    "required": [
+   179	                        "policy_id",
+   180	                        "root_cause",
+   181	                        "candidate_claim_types",
+   182	                        "case_facts",
+   183	                        "recommended_action",
+   184	                        "confidence",
+   185	                    ],
+   186	                },
+   187	            },
+   188	            "required": ["reason", "structured_summary"],
+   189	        },
+   190	    },
+   191	]
+   192	
+   193	# ----------------------------------------------------------------------------
+   194	# Errors — Graceful Tool Failure shape
+   195	# ----------------------------------------------------------------------------
+   196	
+   197	
+   198	def _err(category: str, retryable: bool, message: str) -> str:
+   199	    return json.dumps(
+   200	        {
+   201	            "is_error": True,
+   202	            "error_category": category,
+   203	            "is_retryable": retryable,
+   204	            "message": message,
+   205	        }
+   206	    )
+   207	
+   208	
+   209	def _ok(payload: dict[str, Any]) -> str:
+   210	    return json.dumps(payload)
+   211	
+   212	
+   213	# ----------------------------------------------------------------------------
+   214	# Tool implementations
+   215	# ----------------------------------------------------------------------------
+   216	
+   217	
+   218	def _t_lookup_policy(session: ClaimSession, inp: dict[str, Any]) -> str:
+   219	    pid = inp.get("policy_id")
+   220	    if not isinstance(pid, str):
+   221	        return _err("permanent", False, "policy_id must be a string")
+   222	    policy = session.policies.get(pid)
+   223	    if policy is None:
+   224	        return _err("permanent", False, f"policy_id {pid!r} not found")
+   225	    return _ok(policy)
+   226	
+   227	
+   228	def _t_record_claim_fact(session: ClaimSession, inp: dict[str, Any]) -> str:
+   229	    field = inp.get("field")
+   230	    value = inp.get("value")
+   231	    if not isinstance(field, str) or not isinstance(value, str):
+   232	        return _err("permanent", False, "field and value must both be strings")
+   233	    session.case_facts[field] = value
+   234	    return _ok({"recorded": True, "field": field, "case_facts_count": len(session.case_facts)})
+   235	
+   236	
+   237	def _t_classify_claim(session: ClaimSession, inp: dict[str, Any]) -> str:
+   238	    claim_type = inp.get("claim_type")
+   239	    confidence = inp.get("confidence")
+   240	    rationale = inp.get("rationale")
+   241	    if claim_type not in CLAIM_TYPES:
+   242	        return _err("permanent", False, f"claim_type must be one of {CLAIM_TYPES}")
+   243	    if not isinstance(confidence, (int, float)) or not 0.0 <= float(confidence) <= 1.0:
+   244	        return _err("permanent", False, "confidence must be a number in [0,1]")
+   245	    if not isinstance(rationale, str):
+   246	        return _err("permanent", False, "rationale must be a string")
+   247	    session.classification = {
+   248	        "claim_type": claim_type,
+   249	        "confidence": float(confidence),
+   250	        "rationale": rationale,
+   251	    }
+   252	    return _ok({"recorded": True, **session.classification})
+   253	
+   254	
+   255	def _t_assess_severity(session: ClaimSession, inp: dict[str, Any]) -> str:
+   256	    severity = inp.get("severity")
+   257	    rationale = inp.get("rationale")
+   258	    if severity not in SEVERITIES:
+   259	        return _err("permanent", False, f"severity must be one of {SEVERITIES}")
+   260	    if not isinstance(rationale, str):
+   261	        return _err("permanent", False, "rationale must be a string")
+   262	    session.severity = {"severity": severity, "rationale": rationale}
+   263	    return _ok({"recorded": True, **session.severity})
+   264	
+   265	
+   266	def _t_request_clarification(session: ClaimSession, inp: dict[str, Any]) -> str:
+   267	    question = inp.get("question")
+   268	    candidates = inp.get("ambiguity_between")
+   269	    if not isinstance(question, str):
+   270	        return _err("permanent", False, "question must be a string")
+   271	    if not isinstance(candidates, list) or len(candidates) < 2:
+   272	        return _err("permanent", False, "ambiguity_between must list at least two candidate types")
+   273	    session.clarifications_asked.append({"question": question, "candidates": list(candidates)})
+   274	
+   275	    # Match the question against the fixture's scripted responses.
+   276	    # Pattern matching is intentionally loose: a substring match on the
+   277	    # claimant's keyword is enough. If nothing matches, return NO_RESPONSE.
+   278	    qlow = question.lower()
+   279	    for pattern, reply in session.clarification_responses.items():
+   280	        if pattern.lower() in qlow:
+   281	            return _ok({"claimant_reply": reply})
+   282	    return _ok({"claimant_reply": "NO_RESPONSE"})
+   283	
+   284	
+   285	def _t_route_to_adjuster(session: ClaimSession, inp: dict[str, Any]) -> str:
+   286	    if session.terminal_called:
+   287	        return _err("permanent", False, "terminal tool already called this claim")
+   288	    queue = inp.get("queue")
+   289	    summary = inp.get("claim_summary")
+   290	    if queue not in CLAIM_TYPES:
+   291	        return _err("permanent", False, f"queue must be one of {CLAIM_TYPES}")
+   292	    if not isinstance(summary, str):
+   293	        return _err("permanent", False, "claim_summary must be a string")
+   294	    if session.classification is None:
+   295	        return _err("permanent", False, "classify_claim must be called before routing")
+   296	    if session.severity is None:
+   297	        return _err("permanent", False, "assess_severity must be called before routing")
+   298	
+   299	    record = {
+   300	        "claim_id": session.claim_id,
+   301	        "policy_id": session.policy_id,
+   302	        "claim_type": session.classification["claim_type"],
+   303	        "severity": session.severity["severity"],
+   304	        "confidence": session.classification["confidence"],
+   305	        "rationale": session.classification["rationale"],
+   306	        "claim_summary": summary,
+   307	        "case_facts": dict(session.case_facts),
+   308	    }
+   309	    session.routing = record
+   310	    _append_jsonl(session.run_dir / "queues" / f"{queue}.jsonl", record)
+   311	    return _ok({"routed": True, "queue": queue})
+   312	
+   313	
+   314	def _t_escalate_to_human(session: ClaimSession, inp: dict[str, Any]) -> str:
+   315	    if session.terminal_called:
+   316	        return _err("permanent", False, "terminal tool already called this claim")
+   317	    reason = inp.get("reason")
+   318	    summary = inp.get("structured_summary")
+   319	    if not isinstance(reason, str):
+   320	        return _err("permanent", False, "reason must be a string")
+   321	    if not isinstance(summary, dict):
+   322	        return _err("permanent", False, "structured_summary must be an object")
+   323	    required = {
+   324	        "policy_id",
+   325	        "root_cause",
+   326	        "candidate_claim_types",
+   327	        "case_facts",
+   328	        "recommended_action",
+   329	        "confidence",
+   330	    }
+   331	    missing = required - summary.keys()
+   332	    if missing:
+   333	        return _err("permanent", False, f"structured_summary missing fields: {sorted(missing)}")
+   334	
+   335	    record = {
+   336	        "claim_id": session.claim_id,
+   337	        "policy_id": session.policy_id,
+   338	        "reason": reason,
+   339	        **summary,
+   340	        "case_facts_at_escalation": dict(session.case_facts),
+   341	    }
+   342	    session.escalation = record
+   343	    _append_jsonl(session.run_dir / "escalations.jsonl", record)
+   344	    return _ok({"escalated": True})
+   345	
+   346	
+   347	# ----------------------------------------------------------------------------
+   348	# Dispatcher
+   349	# ----------------------------------------------------------------------------
+   350	
+   351	
+   352	_DISPATCH = {
+   353	    "lookup_policy": _t_lookup_policy,
+   354	    "record_claim_fact": _t_record_claim_fact,
+   355	    "classify_claim": _t_classify_claim,
+   356	    "assess_severity": _t_assess_severity,
+   357	    "request_clarification": _t_request_clarification,
+   358	    "route_to_adjuster": _t_route_to_adjuster,
+   359	    "escalate_to_human": _t_escalate_to_human,
+   360	}
+   361	
+   362	
+   363	def make_executor(session: ClaimSession) -> Executor:
+   364	    """Return a ToolExecutor callable bound to this session."""
+   365	
+   366	    def execute(name: str, tool_input: dict[str, Any]) -> str:
+   367	        handler = _DISPATCH.get(name)
+   368	        if handler is None:
+   369	            return _err("permanent", False, f"unknown tool: {name}")
+   370	        try:
+   371	            return handler(session, tool_input)
+   372	        except Exception as exc:
+   373	            # Defensive: anything raised inside a handler becomes a graceful error,
+   374	            # never crashes the loop.
+   375	            return _err("transient", True, f"{type(exc).__name__}: {exc}")
+   376	
+   377	    return execute
+   378	
+   379	
+   380	# Type alias for clarity; the loop only sees a Callable.
+   381	Executor = Any
+   382	
+   383	
+   384	def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
+   385	    path.parent.mkdir(parents=True, exist_ok=True)
+   386	    with path.open("a", encoding="utf-8") as fh:
+   387	        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+]633;E;echo "##### budget";44dc1b88-5fef-4dfc-afb0-9b7f9f571343]633;C##### budget
+     1	import time
+     2	from dataclasses import dataclass
+     3	
+     4	
+     5	class BudgetExceeded(Exception):
+     6	    pass
+     7	
+     8	
+     9	@dataclass
+    10	class Budget:
+    11	    max_input_tokens: int
+    12	    max_wall_clock_s: float
+    13	    _start: float = 0.0
+    14	    input_tokens_used: int = 0
+    15	
+    16	    def __post_init__(self) -> None:
+    17	        self._start = time.monotonic()
+    18	
+    19	    def record_input_tokens(self, n: int) -> None:
+    20	        self.input_tokens_used += n
+    21	
+    22	    def check(self) -> None:
+    23	        if self.input_tokens_used > self.max_input_tokens:
+    24	            raise BudgetExceeded(
+    25	                f"input_tokens_used={self.input_tokens_used} exceeded "
+    26	                f"max_input_tokens={self.max_input_tokens}"
+    27	            )
+    28	        elapsed = time.monotonic() - self._start
+    29	        if elapsed > self.max_wall_clock_s:
+    30	            raise BudgetExceeded(
+    31	                f"elapsed={elapsed:.1f}s exceeded max_wall_clock_s={self.max_wall_clock_s}"
+    32	            )
+##### run.py
+18:from claims_intake.budget import Budget, BudgetExceeded
+19:from claims_intake.client import default_model, make_client
+47:    model: str,
+51:    max_input_tokens: int,
+52:    max_wall_clock_s: float,
+62:    budget = Budget(
+63:        max_input_tokens=max_input_tokens,
+64:        max_wall_clock_s=max_wall_clock_s,
+74:                model=model,
+79:                budget=budget,
+82:        except (BudgetExceeded, UnexpectedStopReason) as exc:
+85:        _escalate_without_terminal(executor, session)
+96:def _escalate_without_terminal(executor: Any, session: ClaimSession) -> None:
+97:    """Deterministic backstop: the model ended its turn without routing or escalating.
+100:    separate question, answered here in code rather than left to the model. The
+101:    claim is escalated through the same tool the model would have used, so it is
+102:    written to escalations.jsonl like any other escalation.
+105:        "escalate_to_human",
+107:            "reason": "model ended its turn without a terminal action (deterministic backstop)",
+122:def _summary_row(model: str, r: FixtureResult) -> dict[str, Any]:
+134:    elif outcome == "escalated" and s.escalation is not None:
+135:        claim_type = ",".join(s.escalation.get("candidate_claim_types", []))
+149:        "est_cost_usd": round(estimate_cost_usd(model, input_t, output_t), 4),
+156:    run_dir: Path, model: str, rows: list[dict[str, Any]], total_cost: float
+174:        f"- Model: `{model}`",
+215:    parser.add_argument("--model", default=default_model())
+239:            model=args.model,
+243:            max_input_tokens=args.max_input_tokens,
+244:            max_wall_clock_s=args.max_wall_clock_s,
+246:        row = _summary_row(args.model, result)
+259:    total_cost = estimate_cost_usd(args.model, total_input, total_output)
+260:    summary_path = _write_summary(run_dir, args.model, rows, total_cost)
+##### escalations
+{"claim_id": "claim_01_kitchen_fire", "policy_id": "POL-1001", "reason": "model ended its turn without a terminal action (deterministic backstop)", "root_cause": "no terminal tool called before end_turn", "candidate_claim_types": [], "case_facts": {"incident_date": "yesterday evening", "location": "kitchen", "description": "grease fire at stove; extinguished by claimant; charred cabinets above stove; smoke damage on ceiling and walls", "injury_party": "none"}, "recommended_action": "human review of the full transcript", "confidence": 0.0, "case_facts_at_escalation": {"incident_date": "yesterday evening", "location": "kitchen", "description": "grease fire at stove; extinguished by claimant; charred cabinets above stove; smoke damage on ceiling and walls", "injury_party": "none"}}
+{"claim_id": "claim_06_low_confidence_escalation", "policy_id": "POL-1008", "reason": "model ended its turn without a terminal action (deterministic backstop)", "root_cause": "no terminal tool called before end_turn", "candidate_claim_types": [], "case_facts": {"incident_type": "storm damage", "incident_date": "overnight (recent)", "location": "policyholder's driveway/property", "description": "tree or neighbor's shed debris struck property during storm", "damage_areas": "parked car, garage roof, fence section", "emergency_services": "on scene"}, "recommended_action": "human review of the full transcript", "confidence": 0.0, "case_facts_at_escalation": {"incident_type": "storm damage", "incident_date": "overnight (recent)", "location": "policyholder's driveway/property", "description": "tree or neighbor's shed debris struck property during storm", "damage_areas": "parked car, garage roof, fence section", "emergency_services": "on scene"}}
+{"claim_id": "claim_07_tree_falls_on_car", "policy_id": "POL-1005", "reason": "model ended its turn without a terminal action (deterministic backstop)", "root_cause": "no terminal tool called before end_turn", "candidate_claim_types": [], "case_facts": {"incident_date": "Last night", "location": "Front yard/driveway of policyholder's home", "description": "Maple tree from front yard blown down by wind, landed across parked car", "vehicle_damage": "Hood and windshield smashed", "house_damage": "None - tree did not hit house"}, "recommended_action": "human review of the full transcript", "confidence": 0.0, "case_facts_at_escalation": {"incident_date": "Last night", "location": "Front yard/driveway of policyholder's home", "description": "Maple tree from front yard blown down by wind, landed across parked car", "vehicle_damage": "Hood and windshield smashed", "house_damage": "None - tree did not hit house"}}
+]633;E;echo "##### S2 model";44dc1b88-5fef-4dfc-afb0-9b7f9f571343]633;C##### S2 model
+1:"""Anthropic client + model configuration.
+11:   `claude -p --output-format json --model <model>`. This is purely a
+15:`CLAUDE_MODEL` env var overrides the default model in either path.
+28:DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+37:def get_model() -> str:
+38:    """`CLAUDE_MODEL` if set, else the lab's `ANTHROPIC_MODEL`, else DEFAULT_MODEL."""
+39:    return os.environ.get("CLAUDE_MODEL") or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL
+42:def set_model(model: str) -> None:
+43:    os.environ["CLAUDE_MODEL"] = model
+56:def complete(prompt: str, *, model: str | None = None, max_tokens: int = 2048) -> str:
+58:    target_model = model or get_model()
+62:            model=target_model,
+70:        ["claude", "-p", "--model", target_model, "--output-format", "json", prompt],
+83:    model: str | None = None,
+87:    target_model = model or get_model()
+91:            model=target_model,
+104:            "--model",
+105:            target_model,
+##### case_facts_call
+{
+  "model": "claude-haiku-4-5-20251001",
+  "input_tokens": 39209,
+  "output_tokens": 197,
+  "raw_output": {
+    "customer_id": "CUST-88421",
+    "refund_order_id": "ORD-77310",
+    "refund_amount_usd": 22.14,
+    "refund_status": "processed",
+    "subscription_id": "SUB-22119",
+    "subscription_plan": "Pantry Plus Monthly",
+    "subscription_cancel_reason": "duplicate_charge",
+    "subscription_status": "cancelled_with_prorated_refund",
+    "active_payment_method_last4": "4242",
+    "new_payment_method_last4": "7782",
+    "payment_update_failure_code": "AVS_MISMATCH",
+    "payment_update_status": "in_progress"
+  }
+}
+]633;E;echo "##### S3 main";44dc1b88-5fef-4dfc-afb0-9b7f9f571343]633;C##### S3 main
+     1	"""Command-line entry point: validate the team config in the current repo."""
+     2	
+     3	from __future__ import annotations
+     4	
+     5	import argparse
+     6	import sys
+     7	from pathlib import Path
+     8	
+     9	from ecommerce_team_config.claude_md import (
+    10	    distinguishes_project_vs_user_scope,
+    11	    mentions_memory_diagnostic,
+    12	)
+    13	from ecommerce_team_config.command import (
+    14	    body_has_interacting_vs_independent_guidance,
+    15	    body_has_interview_pattern_section,
+    16	    body_has_io_examples,
+    17	    body_has_must_report_vs_skip_criteria,
+    18	    load_command,
+    19	)
+    20	from ecommerce_team_config.imports import unresolved_imports
+    21	from ecommerce_team_config.rules import load_rules
+    22	from ecommerce_team_config.skill import (
+    23	    body_has_branching_reality_note,
+    24	    body_has_check_entries,
+    25	    body_has_main_session_isolation_rationale,
+    26	    body_has_personal_customization_note,
+    27	    body_has_skill_vs_claude_md_rubric,
+    28	    load_skill,
+    29	)
+    30	from ecommerce_team_config.tool_allowlist import write_capable_tools
+    31	
+    32	
+    33	def main(argv: list[str] | None = None) -> int:
+    34	    parser = argparse.ArgumentParser(prog="ecommerce-team-config")
+    35	    parser.add_argument(
+    36	        "repo_root",
+    37	        nargs="?",
+    38	        default=".",
+    39	        help="repository root containing CLAUDE.md and .claude/ (default: cwd)",
+    40	    )
+    41	    args = parser.parse_args(argv)
+    42	    repo_root = Path(args.repo_root).resolve()
+    43	
+    44	    problems: list[str] = []
+    45	    problems.extend(_check_claude_md(repo_root))
+    46	    problems.extend(_check_rules(repo_root))
+    47	    problems.extend(_check_review_command(repo_root))
+    48	    problems.extend(_check_deploy_check_skill(repo_root))
+    49	
+    50	    if problems:
+    51	        print(f"FAIL ({len(problems)} problems):", file=sys.stderr)
+    52	        for p in problems:
+    53	            print(f"  - {p}", file=sys.stderr)
+    54	        return 1
+    55	    print("OK")
+    56	    return 0
+    57	
+    58	
+    59	def _check_claude_md(repo_root: Path) -> list[str]:
+    60	    claude_md = repo_root / "CLAUDE.md"
+    61	    if not claude_md.exists():
+    62	        return ["CLAUDE.md missing at repo root"]
+    63	    out: list[str] = []
+    64	    dangling = unresolved_imports(claude_md, repo_root=repo_root)
+    65	    if dangling:
+    66	        out.append(f"CLAUDE.md has dangling @-import targets: {dangling}")
+    67	    scope = distinguishes_project_vs_user_scope(claude_md)
+    68	    if not all((scope.mentions_user_level, scope.mentions_project_level,
+    69	                scope.states_not_version_controlled, scope.user_scope_example)):
+    70	        out.append("CLAUDE.md scope documentation block is incomplete")
+    71	    if not mentions_memory_diagnostic(claude_md):
+    72	        out.append("CLAUDE.md missing /memory diagnostic reference")
+    73	    return out
+    74	
+    75	
+    76	def _check_rules(repo_root: Path) -> list[str]:
+    77	    rules_dir = repo_root / ".claude" / "rules"
+    78	    if not rules_dir.exists():
+    79	        return [".claude/rules/ directory missing"]
+    80	    rules = load_rules(rules_dir)
+    81	    return [] if rules else [".claude/rules/ contains no rule files"]
+    82	
+    83	
+    84	def _check_review_command(repo_root: Path) -> list[str]:
+    85	    path = repo_root / ".claude" / "commands" / "review.md"
+    86	    if not path.exists():
+    87	        return [".claude/commands/review.md missing"]
+    88	    cmd = load_command(path)
+    89	    out: list[str] = []
+    90	    tools = cmd.frontmatter.get("allowed-tools", [])
+    91	    tool_list = tools if isinstance(tools, list) else [t.strip() for t in str(tools).split(",")]
+    92	    bad = write_capable_tools(tool_list)
+    93	    if bad:
+    94	        out.append(f"/review allowed-tools includes write-capable entries: {bad}")
+    95	    if not body_has_must_report_vs_skip_criteria(cmd.body):
+    96	        out.append("/review body missing must-report-vs-skip criteria")
+    97	    if not body_has_io_examples(cmd.body, minimum=2):
+    98	        out.append("/review body has fewer than 2 concrete I/O examples")
+    99	    if not body_has_interview_pattern_section(cmd.body):
+   100	        out.append("/review body missing interview-pattern subsection")
+   101	    if not body_has_interacting_vs_independent_guidance(cmd.body):
+   102	        out.append("/review body missing interacting-vs-independent guidance")
+   103	    return out
+   104	
+   105	
+   106	def _check_deploy_check_skill(repo_root: Path) -> list[str]:
+   107	    path = repo_root / ".claude" / "skills" / "deploy-check" / "SKILL.md"
+   108	    if not path.exists():
+   109	        return [".claude/skills/deploy-check/SKILL.md missing"]
+   110	    skill = load_skill(path)
+   111	    out: list[str] = []
+   112	    if skill.frontmatter.get("context") != "fork":
+   113	        out.append("/deploy-check frontmatter missing context: fork")
+   114	    tools = skill.frontmatter.get("allowed-tools", [])
+   115	    tool_list = tools if isinstance(tools, list) else [t.strip() for t in str(tools).split(",")]
+   116	    bad = write_capable_tools(tool_list)
+   117	    if bad:
+   118	        out.append(f"/deploy-check allowed-tools includes write-capable entries: {bad}")
+   119	    checks = body_has_check_entries(skill.body)
+   120	    if len(checks) < 3:
+   121	        out.append(f"/deploy-check body lists {len(checks)} checks; need ≥3")
+   122	    for c in checks:
+   123	        if not (c.has_detection and c.has_pass_criterion and c.has_fail_criterion):
+   124	            out.append(f"/deploy-check check {c.title!r} missing detection/pass/fail")
+   125	    if not body_has_main_session_isolation_rationale(skill.body):
+   126	        out.append("/deploy-check body missing main-session isolation rationale")
+   127	    if not body_has_branching_reality_note(skill.body):
+   128	        out.append("/deploy-check body missing Branching Reality reference")
+   129	    if not body_has_personal_customization_note(skill.body):
+   130	        out.append("/deploy-check body missing personal-customization note")
+   131	    if not body_has_skill_vs_claude_md_rubric(skill.body):
+   132	        out.append("/deploy-check body missing skill-vs-CLAUDE.md rubric")
+   133	    return out
+   134	
+   135	
+   136	if __name__ == "__main__":
+   137	    raise SystemExit(main())
+##### CLAUDE.md
+     1	# E-Commerce Platform — Shared Claude Code Conventions
+     2	
+     3	This file is the **project-level** entry point for the e-commerce monorepo. Every teammate's Claude session loads it automatically.
+     4	
+     5	## Scope: what belongs here vs. elsewhere
+     6	
+     7	Claude Code resolves configuration in a hierarchy:
+     8	
+     9	| Scope | Path | Purpose |
+    10	|-------|------|---------|
+    11	| **Project-level** | `./CLAUDE.md`, `.claude/standards/`, `.claude/rules/` | Conventions for *this* repo. Lives in git. Shared with the whole team. |
+    12	| **User-level** | `~/.claude/CLAUDE.md`, `~/.claude/commands/`, `~/.claude/skills/` | Personal preferences. **Not shared via version control** — they stay on your laptop and never reach teammates. |
+    13	| **Directory-level** | `path/CLAUDE.md` inside a subdir | Conventions narrower than the whole repo. We prefer `.claude/rules/` with glob `paths:` instead, so cross-cutting conventions (e.g. test files everywhere) work cleanly. |
+    14	
+    15	If something would only matter to you — your preferred commit-message style, your editor-specific snippets, a personal `/morning` summary command — put it under `~/.claude/`. Anything the whole team should agree on goes here in `./CLAUDE.md` or under `.claude/standards/`.
+    16	
+    17	## Shared standards (modular via @-imports)
+    18	
+    19	The actual conventions live in focused files so this entry point stays scannable:
+    20	
+    21	- @.claude/standards/frontend.md
+    22	- @.claude/standards/api.md
+    23	- @.claude/standards/database.md
+    24	- @.claude/standards/testing.md
+    25	
+    26	Path-scoped rules in [.claude/rules/](.claude/rules/) layer on top of these standards and activate only when Claude is editing matching files (React components, API handlers, test files).
+    27	
+    28	## Repository layout
+    29	
+    30	```
+    31	src/components/   React components (functional + hooks)
+    32	src/pages/        Top-level routes
+    33	src/api/          Node.js API handlers
+    34	src/db/           PostgreSQL repository-pattern modules
+    35	```
+    36	
+    37	Tests are co-located: `Foo.tsx` lives next to `Foo.test.tsx`.
+    38	
+    39	## Troubleshooting
+    40	
+    41	**Convention isn't being followed?** Run `/memory` in your Claude Code session to see exactly which configuration files actually loaded. The most common cause is an instruction that lives in `~/.claude/CLAUDE.md` (user-level, never shared) when it should be in this file or under `.claude/standards/`.
+    42	
+    43	## Team workflows
+    44	
+    45	- `/review <pr-ref>` — codified PR review checklist. See [.claude/commands/review.md](.claude/commands/review.md).
+    46	- `/deploy-check` — read-only pre-deployment validation, runs in a forked sub-agent to keep its output out of your main session. See [.claude/skills/deploy-check/SKILL.md](.claude/skills/deploy-check/SKILL.md).
+    47	
+    48	For decisions about when to use plan mode vs. direct execution on this codebase, see [docs/plan-mode-vs-direct-execution.md](docs/plan-mode-vs-direct-execution.md).
+]633;E;echo "##### S3 scope";44dc1b88-5fef-4dfc-afb0-9b7f9f571343]633;C##### S3 scope
+]633;E;echo "##### S3 scope";44dc1b88-5fef-4dfc-afb0-9b7f9f571343]633;C##### S3 scope
+]633;E;for n in 1 2 3 4;44dc1b88-5fef-4dfc-afb0-9b7f9f571343]633;C== tests system1
+def test_no_string_membership_against_text_in_loop
+def test_no_integer_literal_iteration_cap_in_loop
+def test_stop_reason_is_loop_control
+def test_no_claim_type_equality_branching_in_package
+def test_policies_file_loads_and_covers_all_claim_types
+def test_eight_fixtures_exist
+def test_every_fixture_references_a_known_policy
+def test_fixture_outcome_distribution_meets_targets
+def test_routed_fixtures_cover_all_four_types_and_all_severities
+def test_fixture_schemas_are_consistent
+def test_ambiguous_fixtures_have_clarification_scripts
+def test_claim_06_is_the_escalation_fixture
+def test_loop_terminates_on_end_turn
+def test_loop_continues_on_tool_use
+def test_loop_handles_multiple_tool_use_blocks_in_one_turn
+def test_loop_raises_on_unexpected_stop_reason
+def test_budget_raises_when_token_cap_exceeded
+def test_claim_without_terminal_tool_is_escalated
+def test_seven_tools_registered_with_schemas
+def test_categorical_fields_use_enums
+def test_lookup_policy_returns_record
+def test_lookup_policy_unknown_id_returns_graceful_error
+def test_unknown_tool_returns_graceful_error
+def test_request_clarification_returns_scripted_reply
+def test_request_clarification_no_response_when_unscripted
+def test_routing_requires_classification_and_severity
+def test_routing_writes_jsonl_and_marks_terminal
+def test_escalation_writes_jsonl_and_marks_terminal
+def test_double_terminal_is_graceful_error
+def test_handler_exception_is_caught_as_transient_error
+== tests system2
+def test_pruner_has_no_anthropic_import
+def test_only_tokens_module_uses_count_tokens_or_heuristic
+def test_assemble_module_section_order_contract
+def test_assembled_context_active_segment_byte_exact
+def test_budget_json_section_counts_sum_consistently
+def test_assemble_section_order_exact
+def test_active_segment_byte_exact
+def test_no_interleaving_of_resolved_and_active
+def test_required_fields_has_12_entries
+def test_required_fields_cover_three_issues
+def test_case_facts_dataclass_has_required_fields
+def test_to_markdown_uses_top_level_header_and_fixed_key_order
+def test_extraction_error_lists_missing_fields
+def test_summary_dataclass_carries_token_counts
+def test_compressed_dataclass_carries_active_text_and_id
+def test_summarize_segment_refuses_to_compress_the_active_segment
+def test_compression_prompt_is_committed_and_nontrivial
+def test_lookup_order_fixture_has_at_least_40_fields
+def test_pruner_keeps_exactly_the_contracted_set
+def test_pruned_output_under_200_tokens
+def test_pruner_raises_on_missing_required_field
+def test_count_zero_for_empty_string
+def test_count_returns_positive_int_for_nonempty_text
+def test_count_grows_with_length
+def test_methodology_returns_descriptive_string
+def test_transcript_loader_turn_count
+def test_transcript_loader_partition_boundaries
+def test_transcript_loader_token_count_in_engineered_range
+def test_active_turns_accessor
+def test_canonical_token_function_is_used_everywhere
+== tests system3
+def test_ac_01_01_root_claude_md_has_at_least_one_import
+def test_ac_01_02_two_standards_files_each_imported
+def test_ac_01_03_no_dangling_imports
+def test_ac_01_04_claude_md_under_200_lines
+def test_ac_01_05_documents_scope_and_user_level_not_versioned
+def test_ac_01_06_references_memory_command
+def test_ac_02_01_react_rule_has_component_and_page_globs
+def test_ac_02_02_api_rule_has_api_glob
+def test_ac_02_03_tests_rule_has_test_globs
+def test_ac_02_04_react_file_matches_only_react_rule
+def test_ac_02_05_api_file_matches_only_api_rule
+def test_ac_02_06_test_file_matches_react_and_tests
+def test_ac_02_07_each_rule_has_concrete_body
+def test_ac_03_01_exists_with_valid_frontmatter
+def test_ac_03_02_description_and_argument_hint
+def test_ac_03_03_allowed_tools_is_read_oriented
+def test_ac_03_04_must_report_vs_skip_criteria
+def test_ac_03_05_two_concrete_io_examples
+def test_ac_03_06_is_project_scoped
+def test_ac_03_07_interview_pattern_subsection
+def test_ac_03_08_interacting_vs_independent_guidance
+def test_ac_04_01_exists_with_valid_frontmatter
+def test_ac_04_02_name_description_context_fork
+def test_ac_04_03_allowed_tools_read_only
+def test_ac_04_04_three_pre_deployment_checks
+def test_ac_04_05_rationale_cites_main_session_and_branching_reality
+def test_ac_04_06_personal_customization_note
+def test_ac_04_07_skill_vs_claude_md_rubric
+def test_ac_05_01_doc_exists
+def test_ac_05_02_plan_mode_example_three_files_and_rework_phrasing
+def test_ac_05_03_direct_execution_example
+def test_ac_05_04_explore_example_with_scratchpad
+def test_ac_05_05_knight_webb_curriculum_citation
+def test_ac_05_06_all_cited_file_paths_exist
+def test_ac_05_07_combined_workflow_example
+== tests system4
+def test_hotstate_roundtrip_and_size_budget
+def test_hotstate_rejects_more_than_20_hashes
+def test_hotstate_atomic_write
+def test_warmstore_creates_table_and_index
+def test_warmstore_insert_many_roundtrips
+def test_coldstore_writes_monthly_summary
+def test_coldstore_handles_empty_month
+def test_defects_since_uses_index_and_does_not_load_full_table
+def test_defects_since_respects_limit
+def test_gather_new_defects_is_pure_passthrough_to_sql
+def test_gather_new_defects_has_no_python_side_filtering
+def test_invocation_shapes_are_distinct
+def test_build_rich_prompt_stays_under_4000_chars
+def test_run_shift_invokes_client_exactly_once_and_writes_state
+def test_run_shift_cli_entry_point_works
+def test_append_step_writes_and_fsyncs
+def test_mid_write_read_reveals_prior_complete_lines
+def test_load_returns_incomplete_state
+def test_load_returns_complete_state
+def test_load_on_missing_file_returns_empty
+def test_recovery_decide_truth_table
+def test_recovery_decide_empty_manifest_is_fresh
+def test_threshold_constant_is_30_minutes
+def test_resumed_prompt_has_both_sections
+def test_scratchpad_append_and_read_order
+def test_fork_for_hypothesis_copies_state_without_mutating_base
+def test_two_forks_produce_independent_scratchpads
+def test_merge_findings_appends_without_rewriting_existing
+]633;E;echo "##### warm";44dc1b88-5fef-4dfc-afb0-9b7f9f571343]633;C##### warm
+     1	"""Warm tier: SQLite-backed defect store with indexed `defects_since` query."""
+     2	
+     3	from __future__ import annotations
+     4	
+     5	import sqlite3
+     6	from collections.abc import Iterable, Mapping
+     7	from pathlib import Path
+     8	from typing import Any
+     9	
+    10	SCHEMA_SQL = """
+    11	CREATE TABLE IF NOT EXISTS defects (
+    12	    id TEXT PRIMARY KEY,
+    13	    ts TEXT NOT NULL,
+    14	    shift TEXT NOT NULL,
+    15	    component TEXT NOT NULL,
+    16	    severity TEXT NOT NULL,
+    17	    description TEXT NOT NULL
+    18	);
+    19	CREATE INDEX IF NOT EXISTS idx_defects_shift_ts ON defects(shift, ts);
+    20	CREATE INDEX IF NOT EXISTS idx_defects_ts ON defects(ts);
+    21	"""
+    22	
+    23	
+    24	class WarmStore:
+    25	    def __init__(self, db_path: Path) -> None:
+    26	        self.db_path = db_path
+    27	
+    28	    def _connect(self) -> sqlite3.Connection:
+    29	        conn = sqlite3.connect(self.db_path)
+    30	        conn.row_factory = sqlite3.Row
+    31	        return conn
+    32	
+    33	    def initialize(self) -> None:
+    34	        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    35	        with self._connect() as conn:
+    36	            conn.executescript(SCHEMA_SQL)
+    37	
+    38	    def insert_many(self, rows: Iterable[Mapping[str, Any]]) -> None:
+    39	        payload = [
+    40	            (r["id"], r["ts"], r["shift"], r["component"], r["severity"], r["description"])
+    41	            for r in rows
+    42	        ]
+    43	        with self._connect() as conn:
+    44	            conn.executemany(
+    45	                "INSERT OR REPLACE INTO defects (id, ts, shift, component, severity, description) "
+    46	                "VALUES (?, ?, ?, ?, ?, ?)",
+    47	                payload,
+    48	            )
+    49	
+    50	    def count(self) -> int:
+    51	        with self._connect() as conn:
+    52	            cur = conn.execute("SELECT COUNT(*) FROM defects")
+    53	            return int(cur.fetchone()[0])
+    54	
+    55	    def fetch_by_id(self, defect_id: str) -> dict[str, Any] | None:
+    56	        with self._connect() as conn:
+    57	            cur = conn.execute("SELECT * FROM defects WHERE id = ?", (defect_id,))
+    58	            row = cur.fetchone()
+    59	            return dict(row) if row else None
+    60	
+    61	    def column_names(self, table: str) -> list[str]:
+    62	        with self._connect() as conn:
+    63	            cur = conn.execute(f"PRAGMA table_info({table})")
+    64	            return [r["name"] for r in cur.fetchall()]
+    65	
+    66	    def has_index_on(self, table: str, columns: tuple[str, ...]) -> bool:
+    67	        with self._connect() as conn:
+    68	            indexes = conn.execute(f"PRAGMA index_list({table})").fetchall()
+    69	            for idx in indexes:
+    70	                cols = conn.execute(f"PRAGMA index_info({idx['name']})").fetchall()
+    71	                if tuple(c["name"] for c in cols) == columns:
+    72	                    return True
+    73	            return False
+    74	
+    75	    def defects_since(self, since_ts: str, limit: int = 50) -> list[dict[str, Any]]:
+    76	        """Return defects with ts > since_ts, newest first, up to limit rows.
+    77	
+    78	        This is SQL-side filtering only — no Python-side filtering of severity,
+    79	        component, or time.
+    80	        """
+    81	        with self._connect() as conn:
+    82	            cur = conn.execute(
+    83	                "SELECT * FROM defects WHERE ts > ? ORDER BY ts DESC LIMIT ?",
+    84	                (since_ts, limit),
+    85	            )
+    86	            return [dict(r) for r in cur.fetchall()]
+    87	
+    88	    def explain_defects_since(self, since_ts: str, limit: int = 50) -> list[tuple[Any, ...]]:
+    89	        with self._connect() as conn:
+    90	            cur = conn.execute(
+    91	                "EXPLAIN QUERY PLAN "
+    92	                "SELECT * FROM defects WHERE ts > ? ORDER BY ts DESC LIMIT ?",
+    93	                (since_ts, limit),
+    94	            )
+    95	            return [tuple(r) for r in cur.fetchall()]
+    96	
+    97	    def top_components_for_month(self, year: int, month: int, n: int = 3) -> list[tuple[str, int]]:
+    98	        prefix = f"{year:04d}-{month:02d}"
+    99	        with self._connect() as conn:
+   100	            cur = conn.execute(
+   101	                "SELECT component, COUNT(*) AS c FROM defects "
+   102	                "WHERE ts LIKE ? GROUP BY component ORDER BY c DESC, component ASC LIMIT ?",
+   103	                (f"{prefix}-%", n),
+   104	            )
+   105	            return [(r["component"], int(r["c"])) for r in cur.fetchall()]
+   106	
+   107	    def count_for_month(self, year: int, month: int) -> int:
+   108	        prefix = f"{year:04d}-{month:02d}"
+   109	        with self._connect() as conn:
+   110	            cur = conn.execute(
+   111	                "SELECT COUNT(*) FROM defects WHERE ts LIKE ?", (f"{prefix}-%",)
+   112	            )
+   113	            return int(cur.fetchone()[0])
+##### scratchpad
+     1	"""Append-only typed scratchpad backed by JSON lines."""
+     2	
+     3	from __future__ import annotations
+     4	
+     5	import os
+     6	from datetime import datetime
+     7	from pathlib import Path
+     8	
+     9	from pydantic import BaseModel, ConfigDict
+    10	
+    11	
+    12	class ScratchpadEntry(BaseModel):
+    13	    model_config = ConfigDict(frozen=True)
+    14	
+    15	    hypothesis_id: str
+    16	    evidence: str
+    17	    conclusion: str
+    18	    ts: datetime
+    19	
+    20	
+    21	class Scratchpad:
+    22	    def __init__(self, path: Path) -> None:
+    23	        self.path = path
+    24	
+    25	    def append(self, entry: ScratchpadEntry) -> None:
+    26	        self.path.parent.mkdir(parents=True, exist_ok=True)
+    27	        line = entry.model_dump_json() + "\n"
+    28	        with open(self.path, "ab") as f:
+    29	            f.write(line.encode("utf-8"))
+    30	            f.flush()
+    31	            os.fsync(f.fileno())
+    32	
+    33	    def read(self) -> list[ScratchpadEntry]:
+    34	        if not self.path.exists():
+    35	            return []
+    36	        entries: list[ScratchpadEntry] = []
+    37	        with open(self.path, "rb") as f:
+    38	            for raw in f:
+    39	                line = raw.decode("utf-8").strip()
+    40	                if line:
+    41	                    entries.append(ScratchpadEntry.model_validate_json(line))
+    42	        return entries

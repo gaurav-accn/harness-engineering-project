@@ -1,0 +1,1127 @@
+########## TEMPLATE
+# Reflection Brief — Harness Engineering Capstone
+
+**Name:**
+**Date:**
+
+Replace each `→` with your answer. **Every answer cites at least one artifact from your own runs** — a run ID, file path, token count, claim outcome, or test count. Uncited answers do not pass. 3–6 sentences each unless noted. Paste short artifact snippets where they help.
+
+**Environment**
+
+- Model(s):
+- OS / Python:
+- Approx. API spend:
+
+---
+
+## Part 1 — Per-system
+
+### System 1 — Agentic loop
+
+1. **Loop control.** Quote the `stop_reason` sequence from one trace. Name the file and function that decides continue-vs-stop, and how.
+   → 
+
+2. **Anti-pattern.** Name one anti-pattern `test_antipatterns.py` checks for. What would break in your run if the loop used it?
+   → 
+
+3. **Tool design.** Pick two tools with overlapping inputs. How do the descriptions prevent misrouting? What did a structured tool error let the agent do that a generic string would not?
+   → 
+
+4. **Your numbers.** Quote the turn count and cost for one claim. How does it differ from the README sample, and why?
+   → 
+
+### System 2 — Context strategy
+
+5. **The reduction.** From `budget.json`: baseline tokens, assembled tokens, reduction %. Which section dominates the assembled context, and why keep it verbatim?
+   → 
+
+6. **Summarize vs preserve.** State the rule for what gets summarized vs kept byte-exact, citing your per-section token numbers.
+   → 
+
+7. **Facts block.** Compare `eval.jsonl` to `eval_control.jsonl`. Which question regressed, and what does that prove?
+   → 
+
+### System 3 — Claude Code config
+
+8. **Path-scoped rules.** Quote the glob frontmatter from one rule file. Why is it better than a directory-level CLAUDE.md for cross-cutting conventions?
+   → 
+
+9. **Forked skill.** Quote the `context: fork` and `allowed-tools` lines. What does running forked + read-only buy you? What breaks without it?
+   → 
+
+10. **Scope.** From the validator output: project-level vs user-level scope. Give one example of each from this config.
+    → 
+
+### System 4 — Orchestration
+
+11. **Push work down.** Defects the SQL query returned vs warm-tier total. Name the indexed query. Why does the model never see the full history?
+    → 
+
+12. **Crash recovery.** The resume-vs-fresh decision and its staleness threshold (`recovery.py`). Why is a fresh start with an injected summary sometimes more reliable than resuming?
+    → 
+
+13. **Small state.** Byte size of your `hot_state.json`. Why does the budget matter for a system run once per shift, indefinitely?
+    → 
+
+---
+
+## Part 2 — Synthesis
+
+*Graded on connecting two or more systems. Cite a named file/artifact from each.*
+
+14. **Three layers.** Point to a file/artifact for each layer and justify.
+    → Model:
+    → Harness:
+    → Orchestration:
+
+15. **Deterministic vs prompt.** Cite one behavior guaranteed in code (terminal tool, read-only allowlist, atomic write, byte budget) and one guided by prompt. When is each right?
+    → 
+
+16. **Context, two faces.** Compare context management in System 2 (intra-session) and System 4 (cross-session) with cited numbers from both. Same principle, different mechanism — how?
+    → 
+
+17. **Reliability you can't see in one run.** Name one behavior a test guarantees that a single successful run would not reveal. Why does it matter before shipping?
+    → 
+
+18. **Blast radius.** Pick one system. What's the blast radius if it misbehaves, and what's the kill switch? Ground it in that system's tools, enforcement points, and state.
+    → 
+
+---
+
+## Part 3 — Honest assessment
+
+19. **What broke.** One thing that failed first try in your environment, and how you fixed it. (If nothing, what you checked to be sure.)
+    → 
+
+20. **What you'd change.** One architectural decision you'd make differently, grounded in what you observed.
+    → 
+
+########## SYSTEM 1 FILES
+    1 ./claims_intake/__init__.py
+   16 ./claims_intake/__main__.py
+   32 ./claims_intake/budget.py
+   28 ./claims_intake/client.py
+  132 ./claims_intake/loop.py
+   56 ./claims_intake/pricing.py
+  267 ./claims_intake/run.py
+   42 ./claims_intake/session.py
+   43 ./claims_intake/system_prompt.py
+  387 ./claims_intake/tools.py
+   40 ./claims_intake/tracer.py
+ 1044 total
+
+########## SYSTEM 2 FILES
+    1 ./retail_context/__init__.py
+   10 ./retail_context/__main__.py
+   86 ./retail_context/assemble.py
+  170 ./retail_context/case_facts.py
+  119 ./retail_context/client.py
+   72 ./retail_context/compressor.py
+  108 ./retail_context/evaluate.py
+   48 ./retail_context/pruner.py
+  150 ./retail_context/run.py
+   47 ./retail_context/tokens.py
+   98 ./retail_context/transcript.py
+  202 ./scripts/generate_transcript.py
+ 1111 total
+
+########## SYSTEM 3 FILES
+    0 ./ecommerce_team_config/__init__.py
+  137 ./ecommerce_team_config/__main__.py
+   43 ./ecommerce_team_config/claude_md.py
+   71 ./ecommerce_team_config/command.py
+   22 ./ecommerce_team_config/frontmatter.py
+   28 ./ecommerce_team_config/imports.py
+  111 ./ecommerce_team_config/plan_mode_doc.py
+   55 ./ecommerce_team_config/rules.py
+  106 ./ecommerce_team_config/skill.py
+   80 ./ecommerce_team_config/tool_allowlist.py
+  653 total
+
+########## SYSTEM 4 FILES
+    3 ./shift_monitor/__init__.py
+   81 ./shift_monitor/__main__.py
+   70 ./shift_monitor/client.py
+   37 ./shift_monitor/cold.py
+   35 ./shift_monitor/fork.py
+   92 ./shift_monitor/invocation.py
+   53 ./shift_monitor/manifest.py
+  139 ./shift_monitor/pipeline.py
+   29 ./shift_monitor/recovery.py
+   42 ./shift_monitor/scratchpad.py
+   51 ./shift_monitor/state.py
+  113 ./shift_monitor/warm.py
+  745 total
+
+########## S1 loop source
+=== ./claims_intake/loop.py
+     1	"""The agentic loop.
+     2	
+     3	The defining contract:
+     4	- Control flow is driven by `response.stop_reason`.
+     5	- Loop continues iff stop_reason == "tool_use".
+     6	- Loop returns iff stop_reason == "end_turn".
+     7	- Any other stop_reason raises UnexpectedStopReason.
+     8	
+     9	No string-membership tests against assistant text drive control flow here.
+    10	No integer-literal iteration cap is the primary stopping mechanism.
+    11	A Budget (token + wall-clock, sourced from config) is the safety net and raises
+    12	BudgetExceeded if hit — it never silently truncates.
+    13	"""
+    14	
+    15	import time
+    16	from collections.abc import Callable
+    17	from dataclasses import dataclass, field
+    18	from typing import Any, Protocol
+    19	
+    20	from claims_intake.budget import Budget
+    21	from claims_intake.tracer import Tracer
+    22	
+    23	
+    24	class UnexpectedStopReason(Exception):
+    25	    pass
+    26	
+    27	
+    28	ToolExecutor = Callable[[str, dict[str, Any]], str]
+    29	"""Takes (tool_name, tool_input) and returns the tool_result content as a string.
+    30	Errors are returned as a serialized JSON string with is_error=true; never raised."""
+    31	
+    32	
+    33	class MessagesClient(Protocol):
+    34	    def create(self, **kwargs: Any) -> Any: ...
+    35	
+    36	
+    37	@dataclass
+    38	class FinalState:
+    39	    messages: list[dict[str, Any]]
+    40	    total_input_tokens: int
+    41	    total_output_tokens: int
+    42	    turn_count: int
+    43	    final_content: list[Any] = field(default_factory=list)
+    44	
+    45	
+    46	def run(
+    47	    *,
+    48	    client: Any,
+    49	    model: str,
+    50	    system: str,
+    51	    tools: list[dict[str, Any]],
+    52	    messages: list[dict[str, Any]],
+    53	    tool_executor: ToolExecutor,
+    54	    budget: Budget,
+    55	    tracer: Tracer,
+    56	    max_tokens: int = 4096,
+    57	) -> FinalState:
+    58	    """Run the agentic loop until the model returns stop_reason == "end_turn".
+    59	
+    60	    The loop condition is `response.stop_reason == "tool_use"` — nothing else.
+    61	    There is no `while turn < N` cap. The Budget object is the safety mechanism.
+    62	    """
+    63	    working_messages = list(messages)
+    64	    turn = 0
+    65	    total_input = 0
+    66	    total_output = 0
+    67	
+    68	    while True:
+    69	        turn += 1
+    70	        budget.check()
+    71	        t0 = time.monotonic()
+    72	        response = client.messages.create(
+    73	            model=model,
+    74	            max_tokens=max_tokens,
+    75	            system=system,
+    76	            tools=tools,
+    77	            messages=working_messages,
+    78	        )
+    79	        latency_ms = (time.monotonic() - t0) * 1000.0
+    80	
+    81	        input_tokens = int(response.usage.input_tokens)
+    82	        output_tokens = int(response.usage.output_tokens)
+    83	        total_input += input_tokens
+    84	        total_output += output_tokens
+    85	        budget.record_input_tokens(input_tokens)
+    86	
+    87	        tool_calls = [
+    88	            {"id": b.id, "name": b.name, "input": b.input}
+    89	            for b in response.content
+    90	            if getattr(b, "type", None) == "tool_use"
+    91	        ]
+    92	        tracer.write(
+    93	            {
+    94	                "turn": turn,
+    95	                "stop_reason": response.stop_reason,
+    96	                "tool_calls": tool_calls,
+    97	                "latency_ms": round(latency_ms, 1),
+    98	                "input_tokens": input_tokens,
+    99	                "output_tokens": output_tokens,
+   100	            }
+   101	        )
+   102	
+   103	        if response.stop_reason == "end_turn":
+   104	            working_messages.append({"role": "assistant", "content": response.content})
+   105	            return FinalState(
+   106	                messages=working_messages,
+   107	                total_input_tokens=total_input,
+   108	                total_output_tokens=total_output,
+   109	                turn_count=turn,
+   110	                final_content=list(response.content),
+   111	            )
+   112	
+   113	        if response.stop_reason == "tool_use":
+   114	            working_messages.append({"role": "assistant", "content": response.content})
+   115	            tool_results: list[dict[str, Any]] = []
+   116	            for block in response.content:
+   117	                if getattr(block, "type", None) != "tool_use":
+   118	                    continue
+   119	                result_content = tool_executor(block.name, dict(block.input))
+   120	                tool_results.append(
+   121	                    {
+   122	                        "type": "tool_result",
+   123	                        "tool_use_id": block.id,
+   124	                        "content": result_content,
+   125	                    }
+   126	                )
+   127	            working_messages.append({"role": "user", "content": tool_results})
+   128	            continue
+   129	
+   130	        raise UnexpectedStopReason(
+   131	            f"turn {turn}: unexpected stop_reason={response.stop_reason!r}"
+   132	        )
+
+########## S2 assembly source
+=== ./retail_context/run.py
+     1	"""CLI entry point — runs the full pipeline end-to-end.
+     2	
+     3	Usage:
+     4	    python -m retail_context.run --all
+     5	    python -m retail_context.run --eval
+     6	    python -m retail_context.run --build         # build context.md only (no eval)
+     7	    python -m retail_context.run --eval --model <model-id>
+     8	
+     9	Outputs (under runs/<run_id>/):
+    10	    context.md                — the assembled context
+    11	    budget.json               — token accounting
+    12	    case_facts_call.json      — LLM call log for case-facts extraction
+    13	    eval.jsonl                — eval-question results
+    14	    eval_control.jsonl        — control eval with case-facts stripped
+    15	"""
+    16	from __future__ import annotations
+    17	
+    18	import argparse
+    19	import json
+    20	import sys
+    21	import time
+    22	from pathlib import Path
+    23	from typing import Any
+    24	
+    25	from retail_context import case_facts, compressor, evaluate, tokens, transcript
+    26	from retail_context.assemble import build as build_context
+    27	from retail_context.client import set_model
+    28	
+    29	PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    30	DATA_DIR = PROJECT_ROOT / "data"
+    31	RUNS_DIR = PROJECT_ROOT / "runs"
+    32	
+    33	
+    34	def _run_id() -> str:
+    35	    return time.strftime("%Y%m%d-%H%M%S")
+    36	
+    37	
+    38	def _load_eval_questions() -> list[dict[str, Any]]:
+    39	    return json.loads((DATA_DIR / "eval_questions.json").read_text())["questions"]
+    40	
+    41	
+    42	def _build(run_dir: Path) -> tuple[Any, Any, Any]:
+    43	    print("[1/3] loading transcript + computing baseline token count")
+    44	    t = transcript.load(DATA_DIR / "transcript_48turns.json")
+    45	    baseline = t.token_count
+    46	    print(f"      baseline transcript tokens: {baseline}")
+    47	
+    48	    print("[2/3] extracting case facts (LLM call)")
+    49	    facts = case_facts.extract(t, log_path=run_dir / "case_facts_call.json")
+    50	
+    51	    print("[3/3] compressing resolved segments (LLM calls)")
+    52	    compressed = compressor.compress(t)
+    53	    for issue_id, summary in compressed.summaries.items():
+    54	        print(
+    55	            f"      resolved/{issue_id}: in={summary.input_tokens} out={summary.output_tokens}"
+    56	        )
+    57	
+    58	    assembled = build_context(facts, compressed)
+    59	
+    60	    (run_dir / "context.md").write_text(assembled.markdown)
+    61	
+    62	    section_tokens = assembled.section_tokens()
+    63	    total = assembled.total_tokens()
+    64	    budget = {
+    65	        "token_counter_methodology": tokens.methodology(),
+    66	        "baseline_tokens": baseline,
+    67	        "assembled_tokens": total,
+    68	        "reduction_pct": round((1 - total / baseline) * 100, 2) if baseline else 0,
+    69	        "per_section_tokens": section_tokens,
+    70	        "compression_api": {
+    71	            issue_id: {
+    72	                "input_tokens": s.input_tokens,
+    73	                "output_tokens": s.output_tokens,
+    74	            }
+    75	            for issue_id, s in compressed.summaries.items()
+    76	        },
+    77	    }
+    78	    (run_dir / "budget.json").write_text(json.dumps(budget, indent=2))
+    79	
+    80	    print()
+    81	    print(f"      assembled tokens: {total}  ({budget['reduction_pct']}% reduction)")
+    82	    for k, v in section_tokens.items():
+    83	        print(f"        {k:32s}  {v:>7}")
+    84	
+    85	    return t, facts, assembled
+    86	
+    87	
+    88	def _eval(run_dir: Path, assembled_md: str) -> None:
+    89	    questions = _load_eval_questions()
+    90	
+    91	    print()
+    92	    print(f"[eval] running {len(questions)} questions against compressed context")
+    93	    results = evaluate.run_questions(questions, assembled_md)
+    94	    evaluate.write_jsonl(results, run_dir / "eval.jsonl")
+    95	    for r in results:
+    96	        marker = "PASS" if r.passed else "FAIL"
+    97	        print(f"      {marker}  {r.question_id}  {r.question}")
+    98	        print(f"            answer: {r.model_answer[:120]}")
+    99	    n_passed = sum(1 for r in results if r.passed)
+   100	    print(f"      => {n_passed}/{len(results)} passed")
+   101	
+   102	    print()
+   103	    print("[eval-control] running case-facts-stripped variant against Q1, Q6")
+   104	    stripped = evaluate.strip_case_facts(assembled_md)
+   105	    control_qs = [q for q in questions if q.get("required_in_control_fail")]
+   106	    control_results = evaluate.run_questions(control_qs, stripped)
+   107	    evaluate.write_jsonl(control_results, run_dir / "eval_control.jsonl")
+   108	    for r in control_results:
+   109	        marker = "PASS" if r.passed else "FAIL"
+   110	        expected = "regressed" if not r.passed else "held without case facts"
+   111	        print(f"      {marker}  {r.question_id}  ({expected})")
+   112	        print(f"            answer: {r.model_answer[:120]}")
+   113	    n_regressed = sum(1 for r in control_results if not r.passed)
+   114	    print(f"      => {n_regressed}/{len(control_results)} control questions regressed (≥1 required)")
+   115	
+   116	
+   117	def main(argv: list[str] | None = None) -> int:
+   118	    parser = argparse.ArgumentParser(prog="retail_context.run")
+   119	    parser.add_argument("--all", action="store_true", help="build + eval + control")
+   120	    parser.add_argument("--build", action="store_true", help="build assembled context only")
+   121	    parser.add_argument("--eval", action="store_true", help="build then eval")
+   122	    parser.add_argument("--model", default=None, help="override CLAUDE_MODEL for this run")
+   123	    parser.add_argument("--run-id", default=None, help="override run id (default: timestamp)")
+   124	    args = parser.parse_args(argv)
+   125	
+   126	    if args.model:
+   127	        set_model(args.model)
+   128	
+   129	    if not (args.all or args.build or args.eval):
+   130	        parser.print_help()
+   131	        return 1
+   132	
+   133	    run_id = args.run_id or _run_id()
+   134	    run_dir = RUNS_DIR / run_id
+   135	    run_dir.mkdir(parents=True, exist_ok=True)
+   136	    print(f"run_id: {run_id}  (writing to {run_dir.relative_to(PROJECT_ROOT)})")
+   137	    print()
+   138	
+   139	    _t, _facts, assembled = _build(run_dir)
+   140	
+   141	    if args.eval or args.all:
+   142	        _eval(run_dir, assembled.markdown)
+   143	
+   144	    print()
+   145	    print(f"done. artifacts in: {run_dir.relative_to(PROJECT_ROOT)}")
+   146	    return 0
+   147	
+   148	
+   149	if __name__ == "__main__":
+   150	    sys.exit(main())
+=== ./retail_context/assemble.py
+     1	"""Position-aware context assembly.
+     2	
+     3	Layout (top → bottom):
+     4	  # Case Facts                       — top boundary, structured (≤ 600 tokens)
+     5	  # Resolved: Refund inquiry         — middle, compressible zone (≤ 500 tokens)
+     6	  # Resolved: Subscription cancellation — middle, compressible zone (≤ 500 tokens)
+     7	  # Active issue: Payment-method update — bottom boundary, byte-exact verbatim
+     8	
+     9	This places key findings at both context boundaries (Case Facts at top, the
+    10	active turn-by-turn at bottom against the new user turn) and lets the resolved
+    11	narrative occupy the lower-attention middle. Sections are exclusive — no
+    12	interleaving.
+    13	"""
+    14	from __future__ import annotations
+    15	
+    16	from dataclasses import dataclass
+    17	
+    18	from retail_context.case_facts import CaseFacts
+    19	from retail_context.compressor import Compressed
+    20	from retail_context.tokens import count
+    21	
+    22	# Display titles for the resolved sections. Exact strings are part of the
+    23	# contract; the assemble-order audit regex matches against these.
+    24	RESOLVED_TITLES: dict[str, str] = {
+    25	    "refund": "# Resolved: Refund inquiry",
+    26	    "subscription": "# Resolved: Subscription cancellation",
+    27	}
+    28	ACTIVE_TITLES: dict[str, str] = {
+    29	    "payment_update": "# Active issue: Payment-method update",
+    30	}
+    31	
+    32	
+    33	@dataclass
+    34	class AssembledContext:
+    35	    markdown: str
+    36	    case_facts_block: str
+    37	    resolved_blocks: dict[str, str]
+    38	    active_block: str
+    39	    active_raw_text: str  # byte-exact verbatim source for the active segment
+    40	
+    41	    def section_tokens(self) -> dict[str, int]:
+    42	        sections = {"case_facts": count(self.case_facts_block)}
+    43	        for issue_id, block in self.resolved_blocks.items():
+    44	            sections[f"resolved_{issue_id}"] = count(block)
+    45	        sections["active"] = count(self.active_block)
+    46	        return sections
+    47	
+    48	    def total_tokens(self) -> int:
+    49	        return count(self.markdown)
+    50	
+    51	
+    52	def build(case_facts: CaseFacts, compressed: Compressed) -> AssembledContext:
+    53	    case_block = case_facts.to_markdown().rstrip() + "\n"
+    54	
+    55	    resolved_blocks: dict[str, str] = {}
+    56	    # Preserve declaration order: refund then subscription
+    57	    for issue_id in ("refund", "subscription"):
+    58	        if issue_id not in compressed.summaries:
+    59	            raise KeyError(f"compressed summaries missing required issue {issue_id!r}")
+    60	        title = RESOLVED_TITLES[issue_id]
+    61	        body = compressed.summaries[issue_id].text.strip()
+    62	        resolved_blocks[issue_id] = f"{title}\n\n{body}\n"
+    63	
+    64	    active_title = ACTIVE_TITLES.get(
+    65	        compressed.active_issue_id,
+    66	        f"# Active issue: {compressed.active_issue_id}",
+    67	    )
+    68	    active_block = f"{active_title}\n\n{compressed.active_text}\n"
+    69	
+    70	    markdown = (
+    71	        case_block
+    72	        + "\n"
+    73	        + resolved_blocks["refund"]
+    74	        + "\n"
+    75	        + resolved_blocks["subscription"]
+    76	        + "\n"
+    77	        + active_block
+    78	    )
+    79	
+    80	    return AssembledContext(
+    81	        markdown=markdown,
+    82	        case_facts_block=case_block,
+    83	        resolved_blocks=resolved_blocks,
+    84	        active_block=active_block,
+    85	        active_raw_text=compressed.active_text,
+    86	    )
+=== ./retail_context/evaluate.py
+     1	"""Eval-question runner.
+     2	
+     3	Issues one Claude call per question with the assembled context as the system prompt
+     4	and the question as the user turn. A question passes when the expected fragment
+     5	appears (case-insensitive) in the model's answer. Pass threshold ≥ 5/6.
+     6	
+     7	Also runs a control variant with the Case Facts block removed; Q1 (refund amount)
+     8	and Q6 (exact status token) are the control questions; at least one must FAIL in the
+     9	control — that's how we verify the
+    10	case-facts block is doing real work rather than being coincidentally redundant
+    11	with the active verbatim section.
+    12	"""
+    13	from __future__ import annotations
+    14	
+    15	import json
+    16	from dataclasses import dataclass
+    17	from pathlib import Path
+    18	from typing import Any
+    19	
+    20	from retail_context.client import complete_with_system
+    21	
+    22	EVAL_SYSTEM_PREFIX = (
+    23	    "You are a retail customer-support assistant for Pantry Plus. The conversation"
+    24	    " context for the current customer is provided below. Answer the question concisely"
+    25	    " using only information present in the context. If the answer is not present,"
+    26	    " say 'unknown' — do not invent.\n\n"
+    27	)
+    28	
+    29	
+    30	@dataclass
+    31	class EvalResult:
+    32	    question_id: str
+    33	    question: str
+    34	    expected_fragment: str
+    35	    model_answer: str
+    36	    passed: bool
+    37	    input_tokens: int
+    38	    output_tokens: int
+    39	
+    40	    def to_dict(self) -> dict[str, Any]:
+    41	        return {
+    42	            "question_id": self.question_id,
+    43	            "question": self.question,
+    44	            "expected_fragment": self.expected_fragment,
+    45	            "model_answer": self.model_answer,
+    46	            "passed": self.passed,
+    47	            "input_tokens": self.input_tokens,
+    48	            "output_tokens": self.output_tokens,
+    49	        }
+    50	
+    51	
+    52	def _passed(expected: str, answer: str) -> bool:
+    53	    return expected.lower() in answer.lower()
+    54	
+    55	
+    56	def run_questions(
+    57	    questions: list[dict[str, Any]],
+    58	    context_markdown: str,
+    59	    *,
+    60	    model: str | None = None,
+    61	) -> list[EvalResult]:
+    62	    system = EVAL_SYSTEM_PREFIX + context_markdown
+    63	    results: list[EvalResult] = []
+    64	    for q in questions:
+    65	        answer, in_tok, out_tok = complete_with_system(
+    66	            system,
+    67	            q["question"],
+    68	            model=model,
+    69	            max_tokens=256,
+    70	        )
+    71	        results.append(
+    72	            EvalResult(
+    73	                question_id=q["id"],
+    74	                question=q["question"],
+    75	                expected_fragment=q["expected_fragment"],
+    76	                model_answer=answer,
+    77	                passed=_passed(q["expected_fragment"], answer),
+    78	                input_tokens=in_tok,
+    79	                output_tokens=out_tok,
+    80	            )
+    81	        )
+    82	    return results
+    83	
+    84	
+    85	def strip_case_facts(context_markdown: str) -> str:
+    86	    """Return the assembled context with the `# Case Facts` block removed.
+    87	
+    88	    The control variant — at least one of Q1 / Q6 should fail when this block is gone.
+    89	    """
+    90	    lines = context_markdown.splitlines()
+    91	    out: list[str] = []
+    92	    skipping = False
+    93	    for line in lines:
+    94	        if line.startswith("# Case Facts"):
+    95	            skipping = True
+    96	            continue
+    97	        if skipping and line.startswith("# "):
+    98	            skipping = False
+    99	        if not skipping:
+   100	            out.append(line)
+   101	    return "\n".join(out).lstrip("\n")
+   102	
+   103	
+   104	def write_jsonl(results: list[EvalResult], path: Path) -> None:
+   105	    path.parent.mkdir(parents=True, exist_ok=True)
+   106	    with path.open("w") as f:
+   107	        for r in results:
+   108	            f.write(json.dumps(r.to_dict()) + "\n")
+
+########## S4 recovery/fork source
+=== ./shift_monitor/pipeline.py
+     1	"""Shift pipeline: SQL pre-filter, prompt build, single Claude call, atomic state update."""
+     2	
+     3	from __future__ import annotations
+     4	
+     5	import json
+     6	import logging
+     7	import re
+     8	from collections.abc import Mapping, Sequence
+     9	from dataclasses import dataclass
+    10	from datetime import datetime, timezone
+    11	from pathlib import Path
+    12	from typing import Any
+    13	
+    14	from .client import ClaudeClient, Message
+    15	from .invocation import rich
+    16	from .scratchpad import Scratchpad, ScratchpadEntry
+    17	from .state import HOT_STATE_BYTE_BUDGET, MAX_RECENT_HASHES, HotState
+    18	from .warm import WarmStore
+    19	
+    20	UTC = timezone.utc
+    21	
+    22	log = logging.getLogger(__name__)
+    23	
+    24	JSON_FENCE_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
+    25	
+    26	
+    27	@dataclass(frozen=True)
+    28	class ShiftResult:
+    29	    shift_id: str
+    30	    new_defect_count: int
+    31	    summary: str
+    32	
+    33	
+    34	def gather_new_defects(
+    35	    warm: WarmStore, since_ts: str, limit: int = 50
+    36	) -> list[dict[str, Any]]:
+    37	    return warm.defects_since(since_ts, limit=limit)
+    38	
+    39	
+    40	def build_rich_prompt(
+    41	    role: str, hot_state: HotState, new_defects: Sequence[Mapping[str, Any]]
+    42	) -> str:
+    43	    return rich(role=role, hot_state=hot_state, new_defects=new_defects).prompt
+    44	
+    45	
+    46	def _parse_hot_state_update(response_text: str) -> dict[str, Any] | None:
+    47	    match = JSON_FENCE_RE.search(response_text)
+    48	    if not match:
+    49	        return None
+    50	    try:
+    51	        parsed = json.loads(match.group(1))
+    52	    except json.JSONDecodeError:
+    53	        return None
+    54	    return parsed if isinstance(parsed, dict) else None
+    55	
+    56	
+    57	def _short_summary_from_response(response_text: str, shift_id: str) -> str:
+    58	    for line in response_text.splitlines():
+    59	        stripped = line.strip()
+    60	        if stripped and not stripped.startswith("#") and not stripped.startswith("```"):
+    61	            return stripped[:200]
+    62	    return f"Shift {shift_id}: no summary extracted."
+    63	
+    64	
+    65	def _new_hashes(new_defects: Sequence[Mapping[str, Any]], prior: Sequence[str]) -> list[str]:
+    66	    incoming = [d["id"] for d in new_defects]
+    67	    merged: list[str] = []
+    68	    for h in incoming + list(prior):
+    69	        if h not in merged:
+    70	            merged.append(h)
+    71	        if len(merged) >= MAX_RECENT_HASHES:
+    72	            break
+    73	    return merged
+    74	
+    75	
+    76	def _trim_to_budget(state: HotState) -> HotState:
+    77	    if len(state.to_json_bytes()) <= HOT_STATE_BYTE_BUDGET:
+    78	        return state
+    79	    alerts = list(state.active_alerts)
+    80	    while alerts and len(state.to_json_bytes()) > HOT_STATE_BYTE_BUDGET:
+    81	        alerts.pop()
+    82	        state = state.model_copy(update={"active_alerts": alerts})
+    83	    return state
+    84	
+    85	
+    86	def run_shift(
+    87	    shift_id: str,
+    88	    client: ClaudeClient,
+    89	    warm: WarmStore,
+    90	    hot_state_path: Path,
+    91	    scratchpad_path: Path,
+    92	    since_ts: str,
+    93	    role: str = "quality engineer",
+    94	) -> ShiftResult:
+    95	    log.info("run_shift start: shift=%s since=%s", shift_id, since_ts)
+    96	    hot_state = HotState.from_path(hot_state_path)
+    97	    new_defects = gather_new_defects(warm, since_ts, limit=50)
+    98	    prompt = build_rich_prompt(role=role, hot_state=hot_state, new_defects=new_defects)
+    99	    response = client.complete([Message(role="user", content=prompt)])
+   100	
+   101	    parsed = _parse_hot_state_update(response.content)
+   102	    parsed_summary = parsed.get("current_shift_summary") if parsed else None
+   103	    summary: str = (
+   104	        parsed_summary
+   105	        if isinstance(parsed_summary, str)
+   106	        else _short_summary_from_response(response.content, shift_id)
+   107	    )
+   108	    parsed_alerts = parsed.get("active_alerts") if parsed else None
+   109	    active_alerts: list[str] = (
+   110	        [str(a) for a in parsed_alerts]
+   111	        if isinstance(parsed_alerts, list)
+   112	        else list(hot_state.active_alerts)
+   113	    )
+   114	    parsed_statuses = parsed.get("threshold_statuses") if parsed else None
+   115	    threshold_statuses: dict[str, str] = (
+   116	        {str(k): str(v) for k, v in parsed_statuses.items()}
+   117	        if isinstance(parsed_statuses, dict)
+   118	        else dict(hot_state.threshold_statuses)
+   119	    )
+   120	
+   121	    updated = HotState(
+   122	        recent_defect_hashes=_new_hashes(new_defects, hot_state.recent_defect_hashes),
+   123	        current_shift_summary=summary,
+   124	        active_alerts=active_alerts,
+   125	        threshold_statuses=threshold_statuses,
+   126	    )
+   127	    updated = _trim_to_budget(updated)
+   128	    updated.write_atomic(hot_state_path)
+   129	
+   130	    Scratchpad(scratchpad_path).append(
+   131	        ScratchpadEntry(
+   132	            hypothesis_id=f"shift-{shift_id}",
+   133	            evidence=f"{len(new_defects)} new defects analyzed since {since_ts}",
+   134	            conclusion=summary,
+   135	            ts=datetime.now(UTC),
+   136	        )
+   137	    )
+   138	    log.info("run_shift done: shift=%s new=%d", shift_id, len(new_defects))
+   139	    return ShiftResult(shift_id=shift_id, new_defect_count=len(new_defects), summary=summary)
+=== ./shift_monitor/state.py
+     1	"""Hot-state schema and atomic disk I/O."""
+     2	
+     3	from __future__ import annotations
+     4	
+     5	import os
+     6	import tempfile
+     7	from pathlib import Path
+     8	
+     9	from pydantic import BaseModel, ConfigDict, Field
+    10	from typing_extensions import Self
+    11	
+    12	MAX_RECENT_HASHES = 20
+    13	HOT_STATE_BYTE_BUDGET = 5_120
+    14	
+    15	
+    16	class HotState(BaseModel):
+    17	    """In-context shift state. Kept under ~5 KB so it fits in every prompt."""
+    18	
+    19	    model_config = ConfigDict(frozen=True)
+    20	
+    21	    recent_defect_hashes: list[str] = Field(max_length=MAX_RECENT_HASHES)
+    22	    current_shift_summary: str
+    23	    active_alerts: list[str]
+    24	    threshold_statuses: dict[str, str]
+    25	
+    26	    def to_json_bytes(self) -> bytes:
+    27	        return self.model_dump_json().encode("utf-8")
+    28	
+    29	    @classmethod
+    30	    def from_json_bytes(cls, payload: bytes) -> Self:
+    31	        return cls.model_validate_json(payload)
+    32	
+    33	    @classmethod
+    34	    def from_path(cls, path: Path) -> Self:
+    35	        return cls.from_json_bytes(path.read_bytes())
+    36	
+    37	    def write_atomic(self, path: Path) -> None:
+    38	        path.parent.mkdir(parents=True, exist_ok=True)
+    39	        payload = self.to_json_bytes()
+    40	        if len(payload) > HOT_STATE_BYTE_BUDGET:
+    41	            raise ValueError(
+    42	                f"hot state {len(payload)} bytes exceeds {HOT_STATE_BYTE_BUDGET}-byte budget"
+    43	            )
+    44	        with tempfile.NamedTemporaryFile(
+    45	            mode="wb", dir=path.parent, delete=False, prefix=".hot_state.", suffix=".tmp"
+    46	        ) as tmp:
+    47	            tmp.write(payload)
+    48	            tmp.flush()
+    49	            os.fsync(tmp.fileno())
+    50	            tmp_path = Path(tmp.name)
+    51	        os.replace(tmp_path, path)
+=== ./shift_monitor/invocation.py
+     1	"""Three invocation shapes.
+     2	
+     3	thin     — prompt only.
+     4	rich     — hot state + new defects.
+     5	resumed  — prior partial findings + new defects since the last manifest step.
+     6	"""
+     7	
+     8	from __future__ import annotations
+     9	
+    10	from collections.abc import Mapping, Sequence
+    11	from dataclasses import dataclass
+    12	from typing import Any, Literal
+    13	
+    14	from .state import HotState
+    15	
+    16	InvocationShape = Literal["thin", "rich", "resumed"]
+    17	
+    18	
+    19	@dataclass(frozen=True)
+    20	class Invocation:
+    21	    shape: InvocationShape
+    22	    prompt: str
+    23	
+    24	
+    25	def thin(prompt: str) -> Invocation:
+    26	    return Invocation(shape="thin", prompt=prompt)
+    27	
+    28	
+    29	def rich(
+    30	    role: str, hot_state: HotState, new_defects: Sequence[Mapping[str, Any]]
+    31	) -> Invocation:
+    32	    lines: list[str] = [
+    33	        f"You are the on-call {role} for Northridge Plant 3.",
+    34	        "",
+    35	        "## Current hot state",
+    36	        f"- Recent defect hashes (last {len(hot_state.recent_defect_hashes)}): "
+    37	        f"{', '.join(hot_state.recent_defect_hashes)}",
+    38	        f"- Current shift summary: {hot_state.current_shift_summary}",
+    39	        f"- Active alerts: {hot_state.active_alerts}",
+    40	        f"- Threshold statuses: {hot_state.threshold_statuses}",
+    41	        "",
+    42	        "## New defects since last shift",
+    43	    ]
+    44	    for d in new_defects:
+    45	        lines.append(
+    46	            f"- {d['id']} / {d['ts']} / {d['shift']} / {d['component']} / "
+    47	            f"{d['severity']} / {d['description']}"
+    48	        )
+    49	    lines.extend(
+    50	        [
+    51	            "",
+    52	            "Produce a shift report: Summary, Findings, Recommended actions, "
+    53	            "and an Updated hot state proposal as a JSON block.",
+    54	        ]
+    55	    )
+    56	    return Invocation(shape="rich", prompt="\n".join(lines))
+    57	
+    58	
+    59	def resumed(
+    60	    session_id: str,
+    61	    summary: str,
+    62	    latest_message: str,
+    63	    prior_steps: Sequence[Mapping[str, Any]],
+    64	    new_defects: Sequence[Mapping[str, Any]],
+    65	) -> Invocation:
+    66	    lines: list[str] = [
+    67	        f"Resuming session {session_id}.",
+    68	        "",
+    69	        "## Prior partial findings",
+    70	    ]
+    71	    for step in prior_steps:
+    72	        payload_str = str(step.get("payload", {}))[:120]
+    73	        lines.append(f"- {step['name']}: {payload_str}")
+    74	    lines.extend(
+    75	        [
+    76	            "",
+    77	            "## Prior summary",
+    78	            summary,
+    79	            "",
+    80	            "## New defects since last partial step",
+    81	        ]
+    82	    )
+    83	    if not new_defects:
+    84	        lines.append("- (none)")
+    85	    else:
+    86	        for d in new_defects:
+    87	            lines.append(
+    88	                f"- {d['id']} / {d['ts']} / {d['component']} / "
+    89	                f"{d['severity']} / {d['description']}"
+    90	            )
+    91	    lines.extend(["", "## Latest instruction", latest_message])
+    92	    return Invocation(shape="resumed", prompt="\n".join(lines))
+=== ./shift_monitor/manifest.py
+     1	"""Incremental crash-recovery manifest backed by JSON lines + fsync."""
+     2	
+     3	from __future__ import annotations
+     4	
+     5	import os
+     6	from datetime import datetime
+     7	from pathlib import Path
+     8	from typing import Any, Literal
+     9	
+    10	from pydantic import BaseModel, ConfigDict
+    11	
+    12	InvocationShape = Literal["thin", "rich", "resumed"]
+    13	
+    14	
+    15	class Step(BaseModel):
+    16	    model_config = ConfigDict(frozen=True)
+    17	
+    18	    step_id: str
+    19	    name: str
+    20	    ts: datetime
+    21	    invocation_shape: InvocationShape
+    22	    payload: dict[str, Any]
+    23	
+    24	
+    25	class ManifestState(BaseModel):
+    26	    complete: bool
+    27	    steps: list[Step]
+    28	
+    29	
+    30	class Manifest:
+    31	    def __init__(self, path: Path) -> None:
+    32	        self.path = path
+    33	
+    34	    def append_step(self, step: Step) -> None:
+    35	        self.path.parent.mkdir(parents=True, exist_ok=True)
+    36	        line = step.model_dump_json() + "\n"
+    37	        with open(self.path, "ab") as f:
+    38	            f.write(line.encode("utf-8"))
+    39	            f.flush()
+    40	            os.fsync(f.fileno())
+    41	
+    42	    @classmethod
+    43	    def load(cls, path: Path) -> ManifestState:
+    44	        if not path.exists():
+    45	            return ManifestState(complete=False, steps=[])
+    46	        steps: list[Step] = []
+    47	        with open(path, "rb") as f:
+    48	            for raw in f:
+    49	                line = raw.decode("utf-8").strip()
+    50	                if line:
+    51	                    steps.append(Step.model_validate_json(line))
+    52	        complete = bool(steps) and steps[-1].name == "complete"
+    53	        return ManifestState(complete=complete, steps=steps)
+=== ./shift_monitor/fork.py
+     1	"""Layer 3 fork: copy hot state into an isolated working directory per hypothesis.
+     2	
+     3	`fork_session` here is the application-side framing: the SDK / CLI primitive lives at
+     4	Layer 2; here we reproduce the *semantics* (shared baseline, isolated scratchpads,
+     5	no cross-contamination) using state-file copies.
+     6	"""
+     7	
+     8	from __future__ import annotations
+     9	
+    10	import shutil
+    11	from collections.abc import Iterable
+    12	from pathlib import Path
+    13	
+    14	from .scratchpad import Scratchpad
+    15	
+    16	
+    17	def fork_for_hypothesis(
+    18	    base_hot_state_path: Path,
+    19	    hypothesis_id: str,
+    20	    forks_root: Path,
+    21	) -> Path:
+    22	    fork_dir = forks_root / hypothesis_id
+    23	    fork_dir.mkdir(parents=True, exist_ok=True)
+    24	    target = fork_dir / "hot_state.json"
+    25	    shutil.copyfile(base_hot_state_path, target)
+    26	    return fork_dir
+    27	
+    28	
+    29	def merge_findings(scratchpad_paths: Iterable[Path], main_scratchpad: Path) -> None:
+    30	    main = Scratchpad(main_scratchpad)
+    31	    for path in scratchpad_paths:
+    32	        if not path.exists():
+    33	            continue
+    34	        for entry in Scratchpad(path).read():
+    35	            main.append(entry)
+=== ./shift_monitor/recovery.py
+     1	"""Resume-vs-fresh decision logic for crash recovery.
+     2	
+     3	The 30-minute threshold is ~1/16 of an 8-hour shift cycle: a resume inside this
+     4	window is still operating on the same shift's working set; anything older is
+     5	treated as a stale partial that should be re-started from scratch with whatever
+     6	findings the manifest already captured injected as a summary.
+     7	"""
+     8	
+     9	from __future__ import annotations
+    10	
+    11	from datetime import datetime, timedelta
+    12	from typing import Literal
+    13	
+    14	from .manifest import ManifestState
+    15	
+    16	STALE_RESUME_THRESHOLD_MINUTES = 30
+    17	
+    18	Decision = Literal["resume", "fresh"]
+    19	
+    20	
+    21	def decide(state: ManifestState, now: datetime) -> Decision:
+    22	    if not state.steps:
+    23	        return "fresh"
+    24	    if state.complete:
+    25	        return "fresh"
+    26	    last_step = state.steps[-1]
+    27	    if now - last_step.ts <= timedelta(minutes=STALE_RESUME_THRESHOLD_MINUTES):
+    28	        return "resume"
+    29	    return "fresh"
+=== ./shift_monitor/__main__.py
+     1	"""CLI entry point: `python -m shift_monitor run-shift --shift <ID>`."""
+     2	
+     3	from __future__ import annotations
+     4	
+     5	import argparse
+     6	import json
+     7	import logging
+     8	import sys
+     9	from datetime import datetime, timedelta, timezone
+    10	from pathlib import Path
+    11	
+    12	from . import pipeline
+    13	from .client import AnthropicClaudeClient, ClaudeClient, RecordedClaudeClient
+    14	from .state import HotState
+    15	from .warm import WarmStore
+    16	
+    17	UTC = timezone.utc
+    18	
+    19	
+    20	def _default_since() -> str:
+    21	    return (datetime.now(UTC) - timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    22	
+    23	
+    24	def _build_client(recorded_path: Path | None) -> ClaudeClient:
+    25	    if recorded_path is not None:
+    26	        payload = json.loads(recorded_path.read_text())
+    27	        return RecordedClaudeClient(responses=[payload["content"]])
+    28	    return AnthropicClaudeClient()
+    29	
+    30	
+    31	def _ensure_hot_state(path: Path) -> None:
+    32	    if path.exists():
+    33	        return
+    34	    HotState(
+    35	        recent_defect_hashes=[],
+    36	        current_shift_summary="(no prior shift)",
+    37	        active_alerts=[],
+    38	        threshold_statuses={},
+    39	    ).write_atomic(path)
+    40	
+    41	
+    42	def main(argv: list[str] | None = None) -> int:
+    43	    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    44	    parser = argparse.ArgumentParser(prog="shift-monitor")
+    45	    sub = parser.add_subparsers(dest="cmd", required=True)
+    46	    rs = sub.add_parser("run-shift", help="Run one shift analysis")
+    47	    rs.add_argument("--shift", required=True, choices=["A", "B", "C"])
+    48	    rs.add_argument("--warm-db", default="data/warm.sqlite")
+    49	    rs.add_argument("--hot-state", default="data/hot_state.json")
+    50	    rs.add_argument("--scratchpad", default="data/shift_scratchpad.jsonl")
+    51	    rs.add_argument("--since", default=None, help="ISO-8601 timestamp; default = 8h ago")
+    52	    rs.add_argument(
+    53	        "--recorded-response",
+    54	        default=None,
+    55	        help="Path to a recorded Claude response JSON (offline mode)",
+    56	    )
+    57	    args = parser.parse_args(argv)
+    58	
+    59	    if args.cmd == "run-shift":
+    60	        warm_path = Path(args.warm_db)
+    61	        warm = WarmStore(warm_path)
+    62	        warm.initialize()
+    63	        hot_state_path = Path(args.hot_state)
+    64	        _ensure_hot_state(hot_state_path)
+    65	        client = _build_client(Path(args.recorded_response) if args.recorded_response else None)
+    66	        result = pipeline.run_shift(
+    67	            shift_id=args.shift,
+    68	            client=client,
+    69	            warm=warm,
+    70	            hot_state_path=hot_state_path,
+    71	            scratchpad_path=Path(args.scratchpad),
+    72	            since_ts=args.since or _default_since(),
+    73	        )
+    74	        print(f"shift {result.shift_id}: {result.new_defect_count} new defects")
+    75	        print(result.summary)
+    76	        return 0
+    77	    return 1
+    78	
+    79	
+    80	if __name__ == "__main__":
+    81	    sys.exit(main())
